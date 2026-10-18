@@ -186,6 +186,18 @@ def list_users(status: str | None = None, role: str | None = None) -> list[dict]
         return [_user(r) for r in con.execute(q + " ORDER BY created_at DESC", args).fetchall()]
 
 
+def set_password(email: str, new_password: str) -> tuple[bool, str]:
+    """Nouveau mot de passe (réinitialisation par l'Admin) ; débloque aussi les essais échoués."""
+    email = normalize_email(email)
+    err = validate_credentials(email, new_password)
+    if err:
+        return False, err
+    with connect() as con:
+        n = con.execute("UPDATE users SET password_hash=? WHERE email=?", (hash_password(new_password), email)).rowcount
+        con.execute("DELETE FROM login_attempts WHERE email=?", (email,))
+    return (True, "Mot de passe modifié.") if n else (False, "Compte introuvable.")
+
+
 def approve_user(email: str) -> bool:
     with connect() as con:
         return con.execute("UPDATE users SET status='active' WHERE email=? AND role='user'", (normalize_email(email),)).rowcount > 0

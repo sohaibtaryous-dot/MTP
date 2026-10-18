@@ -534,8 +534,13 @@ def render_auth():
                     if pw != pw2:
                         st.error("Les deux mots de passe sont différents.")
                     else:
-                        if not (mailer.is_configured() or _is_local()):
-                            st.error("L'envoi d'e-mails n'est pas configuré sur ce serveur : contactez l'administrateur.")
+                        if not mailer.is_configured():
+                            # Pas d'e-mail configuré : inscription directe, validée ensuite par l'Admin
+                            done, msg = database.create_user(email, pw, role="user", status="pending", verified=True)
+                            if done:
+                                st.success("Compte créé avec succès. En attente de validation de l'Admin.")
+                            else:
+                                st.error(msg)
                         else:
                             done, msg = database.create_user(email, pw, role="user", status="pending", verified=False)
                             if not done:
@@ -620,6 +625,18 @@ def render_admin_panel():
                 st.toast(f"{u['email']} supprimé.")
                 st.rerun()
     with t2:
+        ui.section("Créer un utilisateur", "➕")
+        with st.form("form_admin_create_user", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            new_email = c1.text_input("E-mail de l'utilisateur")
+            new_pw = c2.text_input("Mot de passe (8 caractères minimum)", type="password")
+            go = st.form_submit_button("Créer le compte (actif immédiatement)", type="primary")
+        if go:
+            ok, msg = database.create_user(new_email, new_pw, role="user", status="active", verified=True)
+            if ok:
+                st.success(f"Compte créé et actif : {database.normalize_email(new_email)}. Transmettez-lui son e-mail et son mot de passe.")
+            else:
+                st.error(msg)
         ui.section("Utilisateurs actifs", "👥")
         actives = database.list_users(status="active", role="user")
         if not actives:
@@ -628,6 +645,11 @@ def render_admin_panel():
             c1, c2, c3 = st.columns([3, 1, 1.3], vertical_alignment="center")
             c1.markdown(f"<b>{u['email']}</b><br><span style='opacity:.6;font-size:.82rem'>{len(u['assigned_files'])} dossier(s) attribué(s)</span>",
                         unsafe_allow_html=True)
+            with c1.popover("Nouveau mot de passe", icon=":material/key:"):
+                npw = st.text_input("Nouveau mot de passe", type="password", key=f"npw_{u['id']}")
+                if st.button("Enregistrer", key=f"npw_go_{u['id']}"):
+                    ok, msg = database.set_password(u["email"], npw)
+                    (st.success if ok else st.error)(msg)
             if c2.button("Suspendre", key=f"sp_{u['id']}", icon=":material/pause:", use_container_width=True):
                 database.suspend_user(u["email"])
                 st.rerun()
