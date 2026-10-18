@@ -392,6 +392,10 @@ def render_import(ocr, ai_cfg, ai_label: str, basis: str):
 import database  # noqa: E402
 import mailer  # noqa: E402
 
+PLAN_CHOICES = {"Gratuit (consultation)": ("free", None), "Pro — 1 mois": ("pro", 1), "Pro — 3 mois": ("pro", 3),
+                "Pro — 6 mois": ("pro", 6), "Pro — 12 mois": ("pro", 12), "Pro — sans limite": ("pro", None),
+                "Collaborateur (outils Pro offerts, sans accès Admin)": ("collab", None)}
+PRO_MONTHS = {k: v[1] for k, v in PLAN_CHOICES.items() if v[0] == "pro" and v[1]}
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 DISPATCH_FILES = ("FACTURES.xlsx", "BL_REFERENCES_SUMMARY.xlsx")
 
@@ -411,6 +415,9 @@ def sidebar_account(user: dict):
     st.caption("Administrateur" if user["role"] == "admin" else "Utilisateur")
     if st.button("Se déconnecter", use_container_width=True, icon=":material/logout:", key="btn_logout"):
         logout()
+    account_password_box(user)
+    if user["role"] == "admin":
+        admin_pending_watcher()
 
 
 def _is_local() -> bool:
@@ -463,12 +470,47 @@ def _verify_step(email: str):
         st.rerun()
 
 
+def _price_text() -> str:
+    return mailer._setting("PRO_PRICE_TEXT", "50 $ / mois")
+
+
+def _contact_link() -> str:
+    num = "".join(ch for ch in mailer._setting("CONTACT_WHATSAPP", "") if ch.isdigit())
+    return f"https://wa.me/{num}" if num else ""
+
+
+def plans_card():
+    """Présentation des deux formules (page de connexion et espace gratuit)."""
+    c1, c2 = st.columns(2, gap="small")
+    with c1:
+        with st.container(key="card_plan_free"):
+            ui.card_title("📂", "Gratuit", "Consultation et téléchargement",
+                          ["Dossiers attribués", "Téléchargement Excel"])
+            st.caption("Recevez et téléchargez les fichiers préparés pour vous par TIMAR.")
+    with c2:
+        with st.container(key="card_plan_pro"):
+            ui.card_title("⚡", f"Pro — {_price_text()}", "Les mêmes outils que l'administrateur",
+                          ["Import / ventilation", "Export BL & Factures", "Lecture IA", "Vos propres fichiers Excel"])
+            st.caption("Préparez vous-même vos fichiers FACTURES.xlsx, BL_REFERENCES_SUMMARY.xlsx et TOUS_CLIENTS.xlsx.")
+
+
+def upgrade_card():
+    link = _contact_link()
+    with st.container(key="card_upgrade"):
+        ui.card_title("⚡", "Passer à Pro", f"{_price_text()} — créez vos propres fichiers (ventilation, export, lecture IA)")
+        st.caption("Contactez l'administrateur pour activer la formule Pro sur votre compte, puis réglez l'abonnement avec lui.")
+        if link:
+            st.link_button("Contacter TIMAR sur WhatsApp", link, icon=":material/chat:")
+
+
 def render_auth():
     """Page d'accueil : connexion / inscription (ou création du premier compte Admin)."""
     ui.hero_3d({"accès": "sécurisé", "validation": "par l'Admin", "espace": "personnel"},
                badge="TIMAR TANGER · ESPACE SÉCURISÉ", title="Connexion", highlight="Dossiers dédouanés",
                desc="Connectez-vous pour consulter les fichiers qui vous ont été attribués. Les nouveaux comptes sont "
                     "activés par l'administrateur.")
+    ui.section("Nos formules", "⚡")
+    plans_card()
     _, mid, _ = st.columns([1, 1.4, 1])
     with mid:
         with st.container(key="card_auth"):
@@ -556,30 +598,100 @@ def render_auth():
 
 
 # ----------------------------------------------------------------------------- espace utilisateur
+def _zip_dossier(row: dict, email: str) -> bytes:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fname in row["file_paths"]:
+            data = database.read_dispatch_file(row["id"], fname, email)
+            if data is not None:
+                z.writestr(fname, data)
+    return buf.getvalue()
+
+
 def render_user_space(user: dict):
-    """Consultation et téléchargement uniquement : aucun outil d'upload, d'IA ou de ventilation."""
-    rows = database.list_dispatch(user["email"])
-    ui.hero_3d({"dossiers": len(rows), "compte": "actif"}, badge="TIMAR TANGER · ESPACE PERSONNEL",
+    """Consultation et téléchargement uniquement. La liste se met à jour toute seule (toutes les 5 s) :
+    un dossier attribué par l'Admin apparaît sans rafraîchir la page, avec une notification."""
+    ui.hero_3d({"compte": "actif", "accès": "personnel"}, badge="TIMAR TANGER · ESPACE PERSONNEL",
                title="Mes Fichiers", highlight="Dédouanés",
                desc="Retrouvez ici les dossiers attribués par l'administrateur et téléchargez vos fichiers Excel.")
-    ui.section("Mes Fichiers Dédouanés", "📂")
-    if not rows:
-        ui.status_banner("warn", "🟠", "Aucun dossier pour le moment",
-                         "L'administrateur vous attribuera vos dossiers dès qu'ils seront prêts.")
-        return
-    for r in rows:
-        with st.container(key=f"card_dos_{r['id']}"):
-            ui.card_title("📁", r["dossier_name"], f"Attribué le {r['created_at'].replace('T', ' à ')}",
-                          list(r["file_paths"]))
-            cols = st.columns(max(len(r["file_paths"]), 1))
-            for col, fname in zip(cols, r["file_paths"]):
-                data = database.read_dispatch_file(r["id"], fname, user["email"])
-                with col:
-                    if data is None:
-                        st.caption(f"{fname} : fichier introuvable")
-                        continue
-                    st.download_button(f"📥 Télécharger {fname}", data=data, file_name=fname, mime=XLSX_MIME,
-                                       type="primary", use_container_width=True, key=f"dl_{r['id']}_{fname}")
+
+    @st.fragment(run_every=5)
+    def live():
+        sub = database.subscription_info(database.get_user(user["email"]) or user)
+        if sub["state"] == "expire":
+            st.warning(f"Votre abonnement Pro a pris fin le {sub['end']} : vous gardez l'accès à vos dossiers, mais plus aux outils.")
+        elif sub["state"] in ("actif", "bientot"):
+            (st.warning if sub["state"] == "bientot" else st.caption)(
+                f"Abonnement Pro actif jusqu'au {sub['end']} ({sub['days_left']} jour(s) restant(s))."
+                + (" Pensez à le renouveler." if sub["state"] == "bientot" else ""))
+        rows = database.list_dispatch(user["email"])
+        ids = {r["id"] for r in rows}
+        seen = st.session_state.get("seen_dispatch")
+        fresh = st.session_state.setdefault("new_dispatch", set())
+        if seen is not None:
+            for r in rows:
+                if r["id"] not in seen:
+                    fresh.add(r["id"])
+                    st.toast(f"Nouveau dossier : {r['dossier_name']}", icon="📁")
+        st.session_state["seen_dispatch"] = ids
+        fresh &= ids
+        ui.section(f"Mes Fichiers Dédouanés ({len(rows)})", "📂")
+        if fresh:
+            ui.status_banner("ok", "🟢", f"{len(fresh)} nouveau(x) dossier(s) reçu(s)", "Ils sont signalés « Nouveau » ci-dessous.")
+        if not rows:
+            ui.status_banner("warn", "🟠", "Aucun dossier pour le moment",
+                             "Cette page se met à jour automatiquement dès que l'administrateur vous attribue un dossier.")
+            return
+        for r in rows:
+            with st.container(key=f"card_dos_{r['id']}"):
+                tags = (["🆕 Nouveau"] if r["id"] in fresh else []) + list(r["file_paths"])
+                ui.card_title("📁", r["dossier_name"], f"Attribué le {r['created_at'].replace('T', ' à ')}", tags)
+                names = list(r["file_paths"])
+                cols = st.columns(len(names) + 1 if len(names) > 1 else 1)
+                for col, fname in zip(cols, names):
+                    data = database.read_dispatch_file(r["id"], fname, user["email"])
+                    with col:
+                        if data is None:
+                            st.caption(f"{fname} : fichier introuvable")
+                            continue
+                        st.download_button(f"📥 Télécharger {fname}", data=data, file_name=fname, mime=XLSX_MIME,
+                                           type="primary", use_container_width=True, key=f"dl_{r['id']}_{fname}")
+                if len(names) > 1:
+                    with cols[-1]:
+                        st.download_button("📦 Tout (.zip)", data=_zip_dossier(r, user["email"]),
+                                           file_name=f"{r['dossier_name']}.zip", mime="application/zip",
+                                           use_container_width=True, key=f"zip_{r['id']}")
+    live()
+    if database.effective_plan(database.get_user(user["email"]) or user) == "free":
+        upgrade_card()
+
+
+def account_password_box(user: dict):
+    """Changement de mot de passe (barre latérale)."""
+    with st.expander("Changer mon mot de passe"):
+        with st.form("form_chg_pw", clear_on_submit=True):
+            old = st.text_input("Mot de passe actuel", type="password")
+            new = st.text_input("Nouveau mot de passe (8 caractères min.)", type="password")
+            go = st.form_submit_button("Enregistrer", use_container_width=True)
+        if go:
+            ok, msg = database.change_password(user["email"], old, new)
+            (st.success if ok else st.error)(msg)
+
+
+def admin_pending_watcher():
+    """Barre latérale (Admin) : nombre de demandes d'accès en attente, mis à jour toutes les 8 s, avec notification."""
+    @st.fragment(run_every=8)
+    def _w():
+        n = len(database.list_users(status="pending", role="user"))
+        prev = st.session_state.get("pending_prev")
+        if prev is not None and n > prev:
+            st.toast(f"Nouvelle demande d'accès ({n} en attente)", icon="🔔")
+        st.session_state["pending_prev"] = n
+        ui.sidebar_pill(ui.WARNING if n else ui.GOOD,
+                        f"<b>{n}</b>&nbsp;demande(s) d'accès en attente" if n else "Aucune demande en attente")
+    _w()
 
 
 # ----------------------------------------------------------------------------- dispatch (Admin)
@@ -613,11 +725,13 @@ def render_admin_panel():
         if not pending:
             st.info("Aucune demande en attente.")
         for u in pending:
-            c1, c2, c3 = st.columns([3, 1, 1.3], vertical_alignment="center")
+            c1, cd, c2, c3 = st.columns([2.2, 1.8, 1, 1.3], vertical_alignment="center")
             c1.markdown(f"<b>{u['email']}</b><br><span style='opacity:.6;font-size:.82rem'>inscrit le {u['created_at'].replace('T', ' ')}</span>",
                         unsafe_allow_html=True)
+            dur = cd.selectbox("Formule", list(PLAN_CHOICES), index=0, key=f"dur_{u['id']}", label_visibility="collapsed")
             if c2.button("Approuver", type="primary", key=f"ap_{u['id']}", icon=":material/check:", use_container_width=True):
-                database.approve_user(u["email"])
+                plan, months = PLAN_CHOICES[dur]
+                database.approve_user(u["email"], months, plan)
                 st.toast(f"{u['email']} approuvé.")
                 st.rerun()
             if c3.button("Refuser / Supprimer", key=f"rf_{u['id']}", icon=":material/delete:", use_container_width=True):
@@ -627,12 +741,15 @@ def render_admin_panel():
     with t2:
         ui.section("Créer un utilisateur", "➕")
         with st.form("form_admin_create_user", clear_on_submit=True):
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns([2, 2, 1])
             new_email = c1.text_input("E-mail de l'utilisateur")
             new_pw = c2.text_input("Mot de passe (8 caractères minimum)", type="password")
+            new_dur = c3.selectbox("Formule", list(PLAN_CHOICES), index=0)
             go = st.form_submit_button("Créer le compte (actif immédiatement)", type="primary")
         if go:
             ok, msg = database.create_user(new_email, new_pw, role="user", status="active", verified=True)
+            if ok:
+                database.set_plan(new_email, PLAN_CHOICES[new_dur][0], PLAN_CHOICES[new_dur][1])
             if ok:
                 st.success(f"Compte créé et actif : {database.normalize_email(new_email)}. Transmettez-lui son e-mail et son mot de passe.")
             else:
@@ -643,8 +760,27 @@ def render_admin_panel():
             st.info("Aucun utilisateur actif.")
         for u in actives:
             c1, c2, c3 = st.columns([3, 1, 1.3], vertical_alignment="center")
-            c1.markdown(f"<b>{u['email']}</b><br><span style='opacity:.6;font-size:.82rem'>{len(u['assigned_files'])} dossier(s) attribué(s)</span>",
+            sub = database.subscription_info(u)
+            sub_txt = {"gratuit": "Gratuit", "pro_illimite": "⚡ Pro sans limite", "collab": "🤝 Collaborateur (outils Pro offerts)",
+                       "actif": f"⚡ Pro jusqu'au {sub['end']} ({sub['days_left']} j)",
+                       "bientot": f"⚠ Pro jusqu'au {sub['end']} ({sub['days_left']} j)",
+                       "expire": f"⛔ Pro expiré le {sub['end']} (repassé en Gratuit)"}[sub["state"]]
+            c1.markdown(f"<b>{u['email']}</b><br><span style='opacity:.6;font-size:.82rem'>{len(u['assigned_files'])} dossier(s) attribué(s) · {sub_txt}</span>",
                         unsafe_allow_html=True)
+            with c1.popover("Formule / abonnement", icon=":material/event_repeat:"):
+                dd = st.selectbox("Activer / prolonger Pro de", list(PRO_MONTHS), key=f"rn_{u['id']}")
+                if st.button("Prolonger", key=f"rn_go_{u['id']}"):
+                    new_end = database.set_plan(u["email"], "pro", PRO_MONTHS[dd])
+                    st.success(f"Pro jusqu'au {new_end}.")
+                if st.button("Pro sans limite", key=f"rn_inf_{u['id']}"):
+                    database.set_plan(u["email"], "pro", None)
+                    st.success("Pro sans limite.")
+                if st.button("Collaborateur (offert)", key=f"rn_col_{u['id']}"):
+                    database.set_plan(u["email"], "collab")
+                    st.success("Collaborateur : outils Pro offerts, sans accès à la gestion des accès.")
+                if st.button("Repasser en Gratuit", key=f"rn_free_{u['id']}"):
+                    database.set_plan(u["email"], "free")
+                    st.success("Formule Gratuite.")
             with c1.popover("Nouveau mot de passe", icon=":material/key:"):
                 npw = st.text_input("Nouveau mot de passe", type="password", key=f"npw_{u['id']}")
                 if st.button("Enregistrer", key=f"npw_go_{u['id']}"):

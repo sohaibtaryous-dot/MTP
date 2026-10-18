@@ -25,7 +25,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("TIMAR_DATA_DIR", Path(__file__).resolve().parent / "data"))
@@ -52,7 +52,9 @@ CREATE TABLE IF NOT EXISTS users (
     verify_code_hash TEXT,
     verify_expires REAL,
     verify_sent_at REAL,
-    verify_attempts INTEGER NOT NULL DEFAULT 0
+    verify_attempts INTEGER NOT NULL DEFAULT 0,
+    subscription_end TEXT,
+    plan TEXT NOT NULL DEFAULT 'free'
 );
 CREATE TABLE IF NOT EXISTS dossiers_dispatch (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +93,8 @@ def init_db():
         cols = {r["name"] for r in con.execute("PRAGMA table_info(users)").fetchall()}      # migration des bases existantes
         for name, ddl in (("email_verified", "INTEGER NOT NULL DEFAULT 1"), ("verify_code_hash", "TEXT"),
                           ("verify_expires", "REAL"), ("verify_sent_at", "REAL"),
-                          ("verify_attempts", "INTEGER NOT NULL DEFAULT 0")):
+                          ("verify_attempts", "INTEGER NOT NULL DEFAULT 0"), ("subscription_end", "TEXT"),
+                          ("plan", "TEXT NOT NULL DEFAULT 'free'")):
             if name not in cols:
                 con.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
         try:
@@ -198,9 +201,82 @@ def set_password(email: str, new_password: str) -> tuple[bool, str]:
     return (True, "Mot de passe modifié.") if n else (False, "Compte introuvable.")
 
 
-def approve_user(email: str) -> bool:
+def change_password(email: str, old_password: str, new_password: str) -> tuple[bool, str]:
+    """Changement de mot de passe par l'utilisateur lui-même (ancien mot de passe exigé)."""
+    u = get_user(email)
+    if not u or not verify_password(old_password or "", u["password_hash"]):
+        return False, "Mot de passe actuel incorrect."
+    return set_password(email, new_password)
+
+
+def approve_user(email: str, months: int | None = None, plan: str = "free") -> bool:
+    """Active le compte. plan='free' : consultation / téléchargement. plan='pro' : outils complets pendant `months` mois
+    (None = sans limite) à partir d'aujourd'hui."""
     with connect() as con:
-        return con.execute("UPDATE users SET status='active' WHERE email=? AND role='user'", (normalize_email(email),)).rowcount > 0
+        ok = con.execute("UPDATE users SET status='active' WHERE email=? AND role='user'", (normalize_email(email),)).rowcount > 0
+    if ok:
+        set_plan(email, plan, months)
+    return ok
+
+
+# ----------------------------------------------------------------------------- formules : Gratuit / Pro
+def _add_months(d: date, months: int) -> date:
+    y, m = divmod(d.month - 1 + months, 12)
+    y, m = d.year + y, m + 1
+    last = (date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).day
+    return date(y, m, min(d.day, last))
+
+
+def set_plan(email: str, plan: str, months: int | None = None) -> str | None:
+    """Fixe la formule. 'free' : consultation seule. 'pro' : outils complets ; `months` prolonge la date de fin
+    (depuis la fin actuelle si encore valide, sinon depuis aujourd'hui) ; months=None : Pro sans limite."""
+    email = normalize_email(email)
+    if plan not in ("free", "pro", "collab"):
+        raise ValueError("plan invalide")
+    end = None
+    if plan == "pro" and months:
+        u = get_user(email)
+        cur = None
+        if u and u.get("plan") == "pro" and u.get("subscription_end"):
+            try:
+                cur = date.fromisoformat(u["subscription_end"])
+            except ValueError:
+                cur = None
+        start = cur if cur and cur >= date.today() else date.today()
+        end = _add_months(start, int(months)).isoformat()
+    with connect() as con:
+        con.execute("UPDATE users SET plan=?, subscription_end=? WHERE email=? AND role='user'", (plan, end, email))
+    return end
+
+
+def set_subscription_end(email: str, end: str):
+    """Fixe directement la date de fin de l'abonnement Pro (AAAA-MM-JJ)."""
+    with connect() as con:
+        con.execute("UPDATE users SET plan='pro', subscription_end=? WHERE email=? AND role='user'", (end, normalize_email(email)))
+
+
+def subscription_info(user: dict) -> dict:
+    """{'plan': 'admin'|'free'|'pro', 'effective': 'admin'|'free'|'pro', 'state': ..., 'end', 'days_left'}
+    state : 'admin' | 'gratuit' | 'pro_illimite' | 'actif' | 'bientot' | 'expire'  (expire = Pro terminé → retombe en Gratuit)"""
+    if user.get("role") == "admin":
+        return {"plan": "admin", "effective": "admin", "state": "admin", "end": None, "days_left": None}
+    if user.get("plan") == "collab":      # Pro offert par l'Admin : mêmes outils que Pro, jamais d'accès Admin
+        return {"plan": "collab", "effective": "pro", "state": "collab", "end": None, "days_left": None}
+    if (user.get("plan") or "free") != "pro":
+        return {"plan": "free", "effective": "free", "state": "gratuit", "end": None, "days_left": None}
+    end = user.get("subscription_end")
+    if not end:
+        return {"plan": "pro", "effective": "pro", "state": "pro_illimite", "end": None, "days_left": None}
+    try:
+        left = (date.fromisoformat(end) - date.today()).days
+    except ValueError:
+        return {"plan": "pro", "effective": "pro", "state": "pro_illimite", "end": None, "days_left": None}
+    state = "expire" if left < 0 else ("bientot" if left <= 7 else "actif")
+    return {"plan": "pro", "effective": "free" if left < 0 else "pro", "state": state, "end": end, "days_left": left}
+
+
+def effective_plan(user: dict) -> str:
+    return subscription_info(user)["effective"]
 
 
 def suspend_user(email: str) -> bool:
