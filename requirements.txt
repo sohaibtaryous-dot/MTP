@@ -1,0 +1,17 @@
+# TIMAR Tanger - Ventilation Automatique Groupage Alstom Fez
+# Installation sans droits administrateur :  pip install --user -r requirements.txt
+streamlit==1.66.0       # version testée (interface web + Altair pour les graphiques)
+pandas>=2.0
+openpyxl>=3.1
+pdfplumber>=0.11      # extraction texte + tableaux (inclut pypdfium2 pour le rendu des pages scannées)
+PyPDF2>=3.0           # extraction de secours
+pytesseract>=0.3.10   # OCR via Tesseract (binaire portable possible, voir README)
+Pillow>=10.0
+numpy>=1.24
+anthropic>=1.15     # lecture IA multilingue (Claude) — clé API Anthropic requise
+
+# Anciens classeurs Excel .xls (facultatif) :
+# xlrd>=2.0
+
+# OCR 100 % Python (aucun binaire externe, mais ~1 Go avec PyTorch) — décommenter si besoin :
+# easyocr>=1.7
